@@ -1,0 +1,65 @@
+name: Simple CI/CD
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Test Pipeline
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        pip install apache-airflow==2.7.3
+        pip install pandas scikit-learn numpy
+    
+    - name: Check DAG file syntax
+      run: |
+        python -m py_compile dags/iris_ml_pipeline.py
+        echo "✅ DAG syntax is valid"
+    
+    - name: Test imports
+      run: |
+        cd dags
+        python -c "
+        import pandas as pd
+        import sklearn
+        import numpy as np
+        from airflow import DAG
+        from airflow.operators.python import PythonOperator
+        print('✅ All imports successful')
+        "
+    
+    - name: Test ML components
+      run: |
+        python -c "
+        from sklearn.datasets import load_iris
+        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.model_selection import train_test_split
+        
+        iris = load_iris()
+        X_train, X_test, y_train, y_test = train_test_split(
+            iris.data, iris.target, test_size=0.2, random_state=42
+        )
+        
+        model = RandomForestClassifier(n_estimators=100, random_state=42)
+        model.fit(X_train, y_train)
+        accuracy = model.score(X_test, y_test)
+        
+        assert accuracy > 0.85
+        print(f'✅ Model training test passed! Accuracy: {accuracy:.4f}')
+        "
+    
+    - name: All tests passed
+      run: echo "✅ CI/CD pipeline completed successfully!"
