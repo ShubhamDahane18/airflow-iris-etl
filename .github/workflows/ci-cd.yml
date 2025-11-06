@@ -8,6 +8,8 @@ on:
 
 env:
   AIRFLOW_UID: 50000
+  AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+  AIRFLOW__CORE__UNIT_TEST_MODE: 'true'
 
 jobs:
   test:
@@ -26,21 +28,74 @@ jobs:
           python -m pip install --upgrade pip
           pip install apache-airflow==2.7.3 pandas scikit-learn numpy pytest
 
+      - name: Initialize Airflow DB
+        run: |
+          export AIRFLOW_HOME=$(pwd)/airflow_home
+          export AIRFLOW__CORE__LOAD_EXAMPLES=false
+          mkdir -p $AIRFLOW_HOME
+          airflow db init
+
       - name: Lint DAG files
         run: |
-          python -c "from airflow.models import DagBag; dagbag = DagBag('dags'); assert len(dagbag.import_errors) == 0, f'DAG import errors: {dagbag.import_errors}'"
+          export AIRFLOW_HOME=$(pwd)/airflow_home
+          export AIRFLOW__CORE__LOAD_EXAMPLES=false
+          python -c "
+          from airflow.models import DagBag
+          import sys
+          
+          dagbag = DagBag('dags', include_examples=False)
+          
+          if dagbag.import_errors:
+              print('❌ DAG Import Errors:')
+              for filename, error in dagbag.import_errors.items():
+                  print(f'\nFile: {filename}')
+                  print(f'Error: {error}')
+              sys.exit(1)
+          
+          print('✅ No import errors found')
+          print(f'✅ Total DAGs loaded: {len(dagbag.dags)}')
+          "
 
       - name: Test DAG integrity
         run: |
+          export AIRFLOW_HOME=$(pwd)/airflow_home
+          export AIRFLOW__CORE__LOAD_EXAMPLES=false
           python -c "
           from airflow.models import DagBag
-          dagbag = DagBag('dags')
+          import sys
+          
+          dagbag = DagBag('dags', include_examples=False)
+          
+          if not dagbag.dags:
+              print('❌ No DAGs found')
+              sys.exit(1)
+          
+          errors = []
           for dag_id, dag in dagbag.dags.items():
-              print(f'Testing DAG: {dag_id}')
-              assert dag.task_count > 0, f'{dag_id} has no tasks'
+              print(f'\n📋 Testing DAG: {dag_id}')
+              
+              if dag.task_count == 0:
+                  errors.append(f'{dag_id} has no tasks')
+                  continue
+              
+              print(f'  ✓ Tasks: {dag.task_count}')
               for task in dag.tasks:
-                  print(f'  - Task: {task.task_id}')
-          print('All DAGs validated successfully!')
+                  print(f'    - {task.task_id} ({task.task_type})')
+              
+              # Check for cycles
+              try:
+                  dag.test_cycle()
+                  print(f'  ✓ No cycles detected')
+              except Exception as e:
+                  errors.append(f'{dag_id} has cycles: {e}')
+          
+          if errors:
+              print('\n❌ Validation Errors:')
+              for error in errors:
+                  print(f'  - {error}')
+              sys.exit(1)
+          
+          print('\n✅ All DAGs validated successfully!')
           "
 
   build:
@@ -70,11 +125,32 @@ jobs:
       - name: Check services health
         run: |
           docker-compose ps
-          docker-compose logs airflow-webserver | tail -20
+          echo "=== Airflow Webserver Logs ==="
+          docker-compose logs airflow-webserver | tail -30
+          echo "=== Airflow Scheduler Logs ==="
+          docker-compose logs airflow-scheduler | tail -30
 
       - name: Verify Airflow is running
         run: |
-          curl -f http://localhost:8080/health || exit 1
+          max_attempts=10
+          attempt=0
+          until curl -f http://localhost:8080/health || [ $attempt -eq $max_attempts ]; do
+            attempt=$((attempt + 1))
+            echo "Attempt $attempt/$max_attempts - Waiting for Airflow..."
+            sleep 10
+          done
+          
+          if [ $attempt -eq $max_attempts ]; then
+            echo "❌ Airflow failed to start"
+            docker-compose logs
+            exit 1
+          fi
+          
+          echo "✅ Airflow is healthy"
+
+      - name: List DAGs in Airflow
+        run: |
+          docker-compose exec -T airflow-scheduler airflow dags list || true
 
       - name: Stop services
         if: always()
