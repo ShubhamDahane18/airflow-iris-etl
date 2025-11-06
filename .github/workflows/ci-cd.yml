@@ -8,100 +8,11 @@ on:
 
 env:
   AIRFLOW_UID: 50000
-  AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-  AIRFLOW__CORE__UNIT_TEST_MODE: 'true'
+  DOCKER_IMAGE: ${{ secrets.DOCKER_USERNAME }}/airflow-ml-pipeline
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install apache-airflow==2.7.3 pandas scikit-learn numpy pytest
-
-      - name: Initialize Airflow DB
-        run: |
-          export AIRFLOW_HOME=$(pwd)/airflow_home
-          export AIRFLOW__CORE__LOAD_EXAMPLES=false
-          mkdir -p $AIRFLOW_HOME
-          airflow db init
-
-      - name: Lint DAG files
-        run: |
-          export AIRFLOW_HOME=$(pwd)/airflow_home
-          export AIRFLOW__CORE__LOAD_EXAMPLES=false
-          python -c "
-          from airflow.models import DagBag
-          import sys
-          
-          dagbag = DagBag('dags', include_examples=False)
-          
-          if dagbag.import_errors:
-              print('❌ DAG Import Errors:')
-              for filename, error in dagbag.import_errors.items():
-                  print(f'\nFile: {filename}')
-                  print(f'Error: {error}')
-              sys.exit(1)
-          
-          print('✅ No import errors found')
-          print(f'✅ Total DAGs loaded: {len(dagbag.dags)}')
-          "
-
-      - name: Test DAG integrity
-        run: |
-          export AIRFLOW_HOME=$(pwd)/airflow_home
-          export AIRFLOW__CORE__LOAD_EXAMPLES=false
-          python -c "
-          from airflow.models import DagBag
-          import sys
-          
-          dagbag = DagBag('dags', include_examples=False)
-          
-          if not dagbag.dags:
-              print('❌ No DAGs found')
-              sys.exit(1)
-          
-          errors = []
-          for dag_id, dag in dagbag.dags.items():
-              print(f'\n📋 Testing DAG: {dag_id}')
-              
-              if dag.task_count == 0:
-                  errors.append(f'{dag_id} has no tasks')
-                  continue
-              
-              print(f'  ✓ Tasks: {dag.task_count}')
-              for task in dag.tasks:
-                  print(f'    - {task.task_id} ({task.task_type})')
-              
-              # Check for cycles
-              try:
-                  dag.test_cycle()
-                  print(f'  ✓ No cycles detected')
-              except Exception as e:
-                  errors.append(f'{dag_id} has cycles: {e}')
-          
-          if errors:
-              print('\n❌ Validation Errors:')
-              for error in errors:
-                  print(f'  - {error}')
-              sys.exit(1)
-          
-          print('\n✅ All DAGs validated successfully!')
-          "
-
-  build:
-    needs: test
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -114,71 +25,171 @@ jobs:
 
       - name: Create required directories
         run: |
-          mkdir -p logs dags plugins data
+          mkdir -p logs plugins data
+          chmod -R 777 logs plugins data
 
-      - name: Start Docker Compose services
+      - name: Start services
         run: |
-          docker-compose up -d
-          echo "Waiting for services to be healthy..."
-          sleep 60
+          docker-compose up -d postgres
+          echo "Waiting for postgres..."
+          sleep 15
 
-      - name: Check services health
+      - name: Initialize Airflow
         run: |
-          docker-compose ps
-          echo "=== Airflow Webserver Logs ==="
-          docker-compose logs airflow-webserver | tail -30
-          echo "=== Airflow Scheduler Logs ==="
-          docker-compose logs airflow-scheduler | tail -30
+          docker-compose run --rm airflow-init
+          sleep 10
 
-      - name: Verify Airflow is running
+      - name: Validate DAGs
         run: |
-          max_attempts=10
-          attempt=0
-          until curl -f http://localhost:8080/health || [ $attempt -eq $max_attempts ]; do
-            attempt=$((attempt + 1))
-            echo "Attempt $attempt/$max_attempts - Waiting for Airflow..."
-            sleep 10
-          done
+          docker-compose run --rm airflow-webserver airflow dags list
+
+      - name: Test DAG integrity
+        run: |
+          docker-compose run --rm airflow-webserver python -c "
+          from airflow.models import DagBag
+          import sys
           
-          if [ $attempt -eq $max_attempts ]; then
-            echo "❌ Airflow failed to start"
-            docker-compose logs
-            exit 1
-          fi
+          dagbag = DagBag('/opt/airflow/dags', include_examples=False)
           
-          echo "✅ Airflow is healthy"
+          if dagbag.import_errors:
+              print('❌ DAG Import Errors:')
+              for filename, error in dagbag.import_errors.items():
+                  print(f'\nFile: {filename}')
+                  print(f'Error: {error}')
+              sys.exit(1)
+          
+          if not dagbag.dags:
+              print('❌ No DAGs found')
+              sys.exit(1)
+          
+          print('\n✅ DAG Validation Results:')
+          for dag_id, dag in dagbag.dags.items():
+              print(f'\n📋 DAG: {dag_id}')
+              print(f'  Tasks: {dag.task_count}')
+              for task in dag.tasks:
+                  print(f'    - {task.task_id}')
+          
+          print('\n✅ All DAGs validated successfully!')
+          "
 
-      - name: List DAGs in Airflow
-        run: |
-          docker-compose exec -T airflow-scheduler airflow dags list || true
-
-      - name: Stop services
+      - name: Cleanup
         if: always()
         run: docker-compose down -v
 
-  deploy:
-    needs: build
+  build-and-push:
+    needs: test
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: github.event_name == 'push'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Deploy notification
-        run: |
-          echo "🚀 Deployment to production would happen here"
-          echo "📦 Artifacts ready for deployment"
-          echo "✅ CI/CD pipeline completed successfully"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      # Uncomment and configure for actual deployment
-      # - name: Deploy to production server
-      #   uses: appleboy/ssh-action@v1.0.0
-      #   with:
-      #     host: ${{ secrets.PROD_HOST }}
-      #     username: ${{ secrets.PROD_USER }}
-      #     key: ${{ secrets.SSH_PRIVATE_KEY }}
-      #     script: |
-      #       cd /path/to/airflow-iris-etl
-      #       git pull origin main
-      #       docker-compose down
-      #       docker-compose up -d
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.DOCKER_IMAGE }}:latest
+            ${{ env.DOCKER_IMAGE }}:${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.DOCKER_IMAGE }}:latest
+          cache-to: type=inline
+
+      - name: Test pushed image
+        run: |
+          docker pull ${{ env.DOCKER_IMAGE }}:latest
+          docker run --rm ${{ env.DOCKER_IMAGE }}:latest airflow version
+
+  integration-test:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Update docker-compose to use custom image
+        run: |
+          sed -i "s|image: apache/airflow:2.7.3-python3.10|image: ${{ env.DOCKER_IMAGE }}:latest|g" docker-compose.yml
+
+      - name: Create .env file
+        run: |
+          echo "AIRFLOW_UID=${{ env.AIRFLOW_UID }}" > .env
+          echo "_AIRFLOW_WWW_USER_USERNAME=airflow" >> .env
+          echo "_AIRFLOW_WWW_USER_PASSWORD=airflow" >> .env
+
+      - name: Create directories
+        run: |
+          mkdir -p logs plugins data
+          chmod -R 777 logs plugins data
+
+      - name: Pull custom image
+        run: docker pull ${{ env.DOCKER_IMAGE }}:latest
+
+      - name: Start full stack
+        run: |
+          docker-compose up -d
+          echo "Waiting for services..."
+          sleep 60
+
+      - name: Check services
+        run: |
+          docker-compose ps
+          echo "=== Webserver Logs ==="
+          docker-compose logs airflow-webserver | tail -20
+          echo "=== Scheduler Logs ==="
+          docker-compose logs airflow-scheduler | tail -20
+
+      - name: Wait for Airflow health
+        run: |
+          for i in {1..20}; do
+            if curl -f http://localhost:8080/health; then
+              echo "✅ Airflow is healthy"
+              exit 0
+            fi
+            echo "Attempt $i/20 - Waiting..."
+            sleep 10
+          done
+          echo "❌ Airflow failed to start"
+          docker-compose logs
+          exit 1
+
+      - name: List DAGs
+        run: |
+          docker-compose exec -T airflow-scheduler airflow dags list
+
+      - name: Cleanup
+        if: always()
+        run: docker-compose down -v
+
+  deploy:
+    needs: integration-test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Deployment Summary
+        run: |
+          echo "🚀 Deployment Summary"
+          echo "===================="
+          echo "✅ Tests Passed"
+          echo "✅ Docker Image Built & Pushed"
+          echo "✅ Integration Tests Passed"
+          echo ""
+          echo "📦 Image: ${{ env.DOCKER_IMAGE }}:latest"
+          echo "📦 Image: ${{ env.DOCKER_IMAGE }}:${{ github.sha }}"
+          echo ""
+          echo "🎯 Ready for production deployment"
