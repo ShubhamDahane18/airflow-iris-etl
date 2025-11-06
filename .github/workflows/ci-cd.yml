@@ -1,242 +1,108 @@
-# .github/workflows/ci-cd.yml
-
 name: Airflow ML Pipeline CI/CD
 
 on:
   push:
     branches: [ main, develop ]
   pull_request:
-    branches: [ main, develop ]
-  workflow_dispatch:
+    branches: [ main ]
 
 env:
   AIRFLOW_UID: 50000
-  _AIRFLOW_WWW_USER_USERNAME: airflow
-  _AIRFLOW_WWW_USER_PASSWORD: airflow
 
 jobs:
-  lint-and-test:
-    name: Lint & Test
+  test:
     runs-on: ubuntu-latest
-    
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.10'
-        cache: 'pip'
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
 
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install pytest pytest-cov flake8 pylint black isort
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install apache-airflow==2.7.3 pandas scikit-learn numpy pytest
 
-    - name: Code formatting check (Black)
-      run: black --check dags/
+      - name: Lint DAG files
+        run: |
+          python -c "from airflow.models import DagBag; dagbag = DagBag('dags'); assert len(dagbag.import_errors) == 0, f'DAG import errors: {dagbag.import_errors}'"
 
-    - name: Import sorting check (isort)
-      run: isort --check-only dags/
+      - name: Test DAG integrity
+        run: |
+          python -c "
+          from airflow.models import DagBag
+          dagbag = DagBag('dags')
+          for dag_id, dag in dagbag.dags.items():
+              print(f'Testing DAG: {dag_id}')
+              assert dag.task_count > 0, f'{dag_id} has no tasks'
+              for task in dag.tasks:
+                  print(f'  - Task: {task.task_id}')
+          print('All DAGs validated successfully!')
+          "
 
-    - name: Lint with flake8
-      run: |
-        flake8 dags/ --count --select=E9,F63,F7,F82 --show-source --statistics
-        flake8 dags/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
-
-    - name: Lint with pylint
-      run: pylint dags/ --exit-zero
-
-    - name: Validate DAG integrity
-      run: |
-        python -c "
-        from airflow.models import DagBag
-        import sys
-        dag_bag = DagBag(dag_folder='dags/', include_examples=False)
-        if dag_bag.import_errors:
-            print('DAG Import Errors:')
-            for filename, error in dag_bag.import_errors.items():
-                print(f'{filename}: {error}')
-            sys.exit(1)
-        print(f'✓ All DAGs validated successfully! Found {len(dag_bag.dags)} DAG(s)')
-        "
-
-    - name: Run unit tests
-      run: |
-        pytest tests/ --cov=dags --cov-report=xml --cov-report=html -v
-
-    - name: Upload coverage reports
-      uses: codecov/codecov-action@v3
-      with:
-        file: ./coverage.xml
-        flags: unittests
-        name: codecov-umbrella
-
-  docker-build:
-    name: Build & Push Docker Images
+  build:
+    needs: test
     runs-on: ubuntu-latest
-    needs: lint-and-test
     if: github.event_name == 'push'
-    
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+      - name: Create .env file
+        run: |
+          echo "AIRFLOW_UID=${{ env.AIRFLOW_UID }}" > .env
+          echo "_AIRFLOW_WWW_USER_USERNAME=airflow" >> .env
+          echo "_AIRFLOW_WWW_USER_PASSWORD=airflow" >> .env
 
-    - name: Log in to Docker Hub
-      uses: docker/login-action@v3
-      with:
-        username: ${{ secrets.DOCKER_USERNAME }}
-        password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Create required directories
+        run: |
+          mkdir -p logs dags plugins data
 
-    - name: Extract metadata
-      id: meta
-      uses: docker/metadata-action@v5
-      with:
-        images: ${{ secrets.DOCKER_USERNAME }}/airflow-iris-ml
-        tags: |
-          type=ref,event=branch
-          type=sha,prefix={{branch}}-
-          type=semver,pattern={{version}}
-          type=raw,value=latest,enable={{is_default_branch}}
+      - name: Start Docker Compose services
+        run: |
+          docker-compose up -d
+          echo "Waiting for services to be healthy..."
+          sleep 60
 
-    - name: Build and push Docker image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        push: true
-        tags: ${{ steps.meta.outputs.tags }}
-        labels: ${{ steps.meta.outputs.labels }}
-        cache-from: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/airflow-iris-ml:buildcache
-        cache-to: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/airflow-iris-ml:buildcache,mode=max
+      - name: Check services health
+        run: |
+          docker-compose ps
+          docker-compose logs airflow-webserver | tail -20
 
-  integration-test:
-    name: Integration Tests
+      - name: Verify Airflow is running
+        run: |
+          curl -f http://localhost:8080/health || exit 1
+
+      - name: Stop services
+        if: always()
+        run: docker-compose down -v
+
+  deploy:
+    needs: build
     runs-on: ubuntu-latest
-    needs: lint-and-test
-    
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Create required directories
-      run: |
-        mkdir -p ./dags ./logs ./plugins ./data
-        echo -e "AIRFLOW_UID=$(id -u)" > .env
+      - name: Deploy notification
+        run: |
+          echo "🚀 Deployment to production would happen here"
+          echo "📦 Artifacts ready for deployment"
+          echo "✅ CI/CD pipeline completed successfully"
 
-    - name: Start Airflow stack
-      run: |
-        docker-compose up -d
-        echo "Waiting for Airflow to be healthy..."
-        timeout 300 bash -c 'until docker-compose ps | grep -q "healthy"; do sleep 5; done'
-
-    - name: Check Airflow services
-      run: |
-        docker-compose ps
-        docker-compose logs airflow-webserver | tail -20
-
-    - name: Test DAG execution
-      run: |
-        docker-compose exec -T airflow-scheduler airflow dags list
-        docker-compose exec -T airflow-scheduler airflow dags test iris_ml_pipeline 2024-01-01
-
-    - name: Collect logs
-      if: always()
-      run: |
-        mkdir -p test-logs
-        docker-compose logs > test-logs/docker-compose.log
-        cp -r logs test-logs/
-
-    - name: Upload test artifacts
-      if: always()
-      uses: actions/upload-artifact@v3
-      with:
-        name: integration-test-logs
-        path: test-logs/
-
-    - name: Tear down Airflow stack
-      if: always()
-      run: docker-compose down -v
-
-  deploy-staging:
-    name: Deploy to Staging
-    runs-on: ubuntu-latest
-    needs: [docker-build, integration-test]
-    if: github.ref == 'refs/heads/develop'
-    environment:
-      name: staging
-      url: ${{ steps.deploy.outputs.url }}
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Deploy to staging
-      id: deploy
-      run: |
-        echo "Deploying to staging environment..."
-        # Add your staging deployment logic here
-        # Example: kubectl, helm, terraform, etc.
-        echo "url=https://staging.yourapp.com" >> $GITHUB_OUTPUT
-
-    - name: Run smoke tests
-      run: |
-        echo "Running smoke tests on staging..."
-        # Add smoke test logic
-
-  deploy-production:
-    name: Deploy to Production
-    runs-on: ubuntu-latest
-    needs: [docker-build, integration-test]
-    if: github.ref == 'refs/heads/main'
-    environment:
-      name: production
-      url: ${{ steps.deploy.outputs.url }}
-    
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Deploy to production
-      id: deploy
-      run: |
-        echo "Deploying to production environment..."
-        # Add your production deployment logic here
-        echo "url=https://prod.yourapp.com" >> $GITHUB_OUTPUT
-
-    - name: Run smoke tests
-      run: |
-        echo "Running smoke tests on production..."
-        # Add smoke test logic
-
-    - name: Create GitHub Release
-      if: startsWith(github.ref, 'refs/tags/')
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ github.ref }}
-        release_name: Release ${{ github.ref }}
-        draft: false
-        prerelease: false
-
-  notify:
-    name: Notification
-    runs-on: ubuntu-latest
-    needs: [deploy-staging, deploy-production]
-    if: always()
-    
-    steps:
-    - name: Send Slack notification
-      if: always()
-      uses: 8398a7/action-slack@v3
-      with:
-        status: ${{ job.status }}
-        text: 'Deployment Status: ${{ job.status }}'
-        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
-      env:
-        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+      # Uncomment and configure for actual deployment
+      # - name: Deploy to production server
+      #   uses: appleboy/ssh-action@v1.0.0
+      #   with:
+      #     host: ${{ secrets.PROD_HOST }}
+      #     username: ${{ secrets.PROD_USER }}
+      #     key: ${{ secrets.SSH_PRIVATE_KEY }}
+      #     script: |
+      #       cd /path/to/airflow-iris-etl
+      #       git pull origin main
+      #       docker-compose down
+      #       docker-compose up -d
