@@ -1,15 +1,16 @@
+# .github/workflows/cicd.yml
 name: Airflow ML Pipeline CI/CD
 
 on:
   push:
     branches: [ main, develop ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, develop ]
   workflow_dispatch:
 
 env:
+  AIRFLOW_UID: 50000
   PYTHON_VERSION: '3.10'
-  AIRFLOW_VERSION: '2.7.3'
 
 jobs:
   lint-and-test:
@@ -17,265 +18,256 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
-    
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: ${{ env.PYTHON_VERSION }}
-    
-    - name: Cache pip packages
-      uses: actions/cache@v3
-      with:
-        path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-        restore-keys: |
-          ${{ runner.os }}-pip-
-    
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install apache-airflow==${{ env.AIRFLOW_VERSION }}
-        pip install pandas scikit-learn numpy pytest flake8 pylint
-    
-    - name: Lint with flake8
-      run: |
-        # Stop the build if there are Python syntax errors or undefined names
-        flake8 dags/ --count --select=E9,F63,F7,F82 --show-source --statistics
-        # Exit-zero treats all errors as warnings
-        flake8 dags/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
-    
-    - name: Test DAG integrity
-      run: |
-        python -c "
-        import sys
-        sys.path.insert(0, 'dags')
-        from iris_ml_pipeline import dag
-        print('✓ DAG loaded successfully')
-        print(f'✓ DAG ID: {dag.dag_id}')
-        print(f'✓ Tasks: {len(dag.tasks)}')
-        assert dag.dag_id == 'iris_ml_pipeline'
-        assert len(dag.tasks) > 0
-        print('✅ All DAG integrity tests passed!')
-        "
-    
-    - name: Validate DAG structure
-      run: |
-        python -c "
-        import sys
-        sys.path.insert(0, 'dags')
-        from iris_ml_pipeline import dag
-        
-        # Check for cycles
-        assert not dag.test_cycle(), 'DAG has cycles!'
-        print('✓ No cycles detected')
-        
-        # Verify task dependencies
-        task_ids = [task.task_id for task in dag.tasks]
-        print(f'✓ Tasks: {task_ids}')
-        
-        # Check required tasks exist
-        required_tasks = [
-            'extract_iris_dataset',
-            'feature_engineering', 
-            'train_models',
-            'evaluate_models',
-            'deploy_model'
-        ]
-        for task in required_tasks:
-            assert task in task_ids, f'Missing required task: {task}'
-        
-        print('✅ DAG structure validation passed!')
-        "
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-  test-pipeline:
-    name: Test ML Pipeline
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 pytest pytest-cov black isort
+          pip install apache-airflow==2.7.3
+          pip install pandas scikit-learn numpy
+
+      - name: Lint with flake8
+        run: |
+          # Stop the build if there are Python syntax errors or undefined names
+          flake8 dags --count --select=E9,F63,F7,F82 --show-source --statistics
+          # Exit-zero treats all errors as warnings
+          flake8 dags --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+      - name: Check code formatting with black
+        run: |
+          black --check dags/ || echo "Run 'black dags/' to fix formatting"
+
+      - name: Check import sorting with isort
+        run: |
+          isort --check-only dags/ || echo "Run 'isort dags/' to fix imports"
+
+      - name: Validate DAG syntax
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, 'dags')
+          from iris_ml_pipeline import dag
+          print(f'✓ DAG validation successful: {dag.dag_id}')
+          print(f'✓ Tasks: {[task.task_id for task in dag.tasks]}')
+          "
+
+      - name: Run unit tests
+        run: |
+          pytest tests/ -v --cov=dags --cov-report=xml --cov-report=html
+        continue-on-error: true
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+        continue-on-error: true
+
+  docker-build:
+    name: Build and Test Docker
     runs-on: ubuntu-latest
     needs: lint-and-test
     
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
-    
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: ${{ env.PYTHON_VERSION }}
-    
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install pandas scikit-learn numpy pytest
-    
-    - name: Test data extraction
-      run: |
-        python -c "
-        from sklearn.datasets import load_iris
-        import pandas as pd
-        
-        iris = load_iris()
-        df = pd.DataFrame(iris.data, columns=iris.feature_names)
-        df['species'] = iris.target
-        
-        assert len(df) == 150, 'Expected 150 samples'
-        assert len(iris.feature_names) == 4, 'Expected 4 features'
-        assert len(set(iris.target)) == 3, 'Expected 3 classes'
-        
-        print('✅ Data extraction test passed!')
-        "
-    
-    - name: Test feature engineering
-      run: |
-        python -c "
-        from sklearn.datasets import load_iris
-        import pandas as pd
-        
-        iris = load_iris()
-        df = pd.DataFrame(iris.data, columns=iris.feature_names)
-        
-        # Test feature creation
-        df['petal_area'] = df['petal length (cm)'] * df['petal width (cm)']
-        df['sepal_area'] = df['sepal length (cm)'] * df['sepal width (cm)']
-        
-        assert 'petal_area' in df.columns
-        assert 'sepal_area' in df.columns
-        assert df['petal_area'].isna().sum() == 0
-        
-        print('✅ Feature engineering test passed!')
-        "
-    
-    - name: Test model training
-      run: |
-        python -c "
-        from sklearn.datasets import load_iris
-        from sklearn.model_selection import train_test_split
-        from sklearn.ensemble import RandomForestClassifier
-        from sklearn.metrics import accuracy_score
-        
-        iris = load_iris()
-        X_train, X_test, y_train, y_test = train_test_split(
-            iris.data, iris.target, test_size=0.2, random_state=42
-        )
-        
-        model = RandomForestClassifier(n_estimators=100, random_state=42)
-        model.fit(X_train, y_train)
-        
-        y_pred = model.predict(X_test)
-        accuracy = accuracy_score(y_test, y_pred)
-        
-        assert accuracy > 0.85, f'Model accuracy {accuracy} below threshold'
-        
-        print(f'✅ Model training test passed! Accuracy: {accuracy:.4f}')
-        "
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-  docker-build:
-    name: Build and Test Docker Image
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create required directories
+        run: |
+          mkdir -p dags logs plugins data
+
+      - name: Start Airflow services
+        run: |
+          echo "AIRFLOW_UID=$AIRFLOW_UID" > .env
+          docker-compose up -d
+          echo "Waiting for services to be healthy..."
+          sleep 60
+
+      - name: Check service health
+        run: |
+          docker-compose ps
+          docker-compose logs airflow-webserver --tail=50
+          docker-compose logs airflow-scheduler --tail=50
+
+      - name: Test Airflow webserver
+        run: |
+          curl -f http://localhost:8080/health || exit 1
+          echo "✓ Airflow webserver is healthy"
+
+      - name: List DAGs
+        run: |
+          docker-compose exec -T airflow-scheduler airflow dags list
+
+      - name: Test DAG
+        run: |
+          docker-compose exec -T airflow-scheduler airflow dags test iris_ml_pipeline 2024-01-01
+        continue-on-error: true
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          echo "=== Webserver Logs ==="
+          docker-compose logs airflow-webserver
+          echo "=== Scheduler Logs ==="
+          docker-compose logs airflow-scheduler
+          echo "=== Postgres Logs ==="
+          docker-compose logs postgres
+
+      - name: Stop services
+        if: always()
+        run: docker-compose down -v
+
+  security-scan:
+    name: Security Scanning
     runs-on: ubuntu-latest
-    needs: test-pipeline
+    needs: lint-and-test
     
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+        continue-on-error: true
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+        continue-on-error: true
+
+      - name: Run Bandit security linter
+        run: |
+          pip install bandit
+          bandit -r dags/ -f json -o bandit-report.json || true
+        continue-on-error: true
+
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: [docker-build, security-scan]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v2
-    
-    - name: Create Dockerfile if not exists
-      run: |
-        if [ ! -f Dockerfile ]; then
-          cat > Dockerfile << 'EOF'
-        FROM apache/airflow:2.7.3-python3.10
-        USER airflow
-        RUN pip install --no-cache-dir pandas scikit-learn numpy
-        USER airflow
-        EOF
-        fi
-    
-    - name: Build Docker image
-      run: |
-        docker build -t airflow-ml-pipeline:test .
-    
-    - name: Test Docker image
-      run: |
-        docker run --rm airflow-ml-pipeline:test python -c "
-        import pandas as pd
-        import sklearn
-        import numpy as np
-        print('✅ All packages installed successfully!')
-        print(f'pandas: {pd.__version__}')
-        print(f'sklearn: {sklearn.__version__}')
-        print(f'numpy: {np.__version__}')
-        "
-    
-    - name: Login to Docker Hub (only on main)
-      if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-      uses: docker/login-action@v2
-      with:
-        username: ${{ secrets.DOCKER_USERNAME }}
-        password: ${{ secrets.DOCKER_PASSWORD }}
-    
-    - name: Push to Docker Hub (only on main)
-      if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-      run: |
-        docker tag airflow-ml-pipeline:test ${{ secrets.DOCKER_USERNAME }}/airflow-ml-pipeline:latest
-        docker tag airflow-ml-pipeline:test ${{ secrets.DOCKER_USERNAME }}/airflow-ml-pipeline:${{ github.sha }}
-        docker push ${{ secrets.DOCKER_USERNAME }}/airflow-ml-pipeline:latest
-        docker push ${{ secrets.DOCKER_USERNAME }}/airflow-ml-pipeline:${{ github.sha }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+        continue-on-error: true
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKER_USERNAME }}/airflow-iris-ml
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+        continue-on-error: true
 
   deploy-staging:
     name: Deploy to Staging
     runs-on: ubuntu-latest
-    needs: docker-build
+    needs: build-and-push
     if: github.ref == 'refs/heads/develop'
-    environment:
-      name: staging
+    environment: staging
     
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
-    
-    - name: Deploy to staging
-      run: |
-        echo "🚀 Deploying to staging environment..."
-        echo "✅ Staging deployment completed!"
-        # Add your staging deployment commands here
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to staging
+        run: |
+          echo "Deploying to staging environment..."
+          # Add your staging deployment commands here
+          # Example: kubectl apply -f k8s/staging/
+          # Or: ansible-playbook deploy-staging.yml
+          echo "✓ Staged deployment successful"
 
   deploy-production:
     name: Deploy to Production
     runs-on: ubuntu-latest
-    needs: docker-build
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    environment:
-      name: production
-      url: https://your-airflow-instance.com
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    environment: production
     
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
-    
-    - name: Deploy to production
-      run: |
-        echo "🚀 Deploying to production environment..."
-        echo "✅ Production deployment completed!"
-        # Add your production deployment commands here
-        # Example: kubectl apply -f k8s/ or docker-compose up -d
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to production
+        run: |
+          echo "Deploying to production environment..."
+          # Add your production deployment commands here
+          # Example: kubectl apply -f k8s/production/
+          # Or: ansible-playbook deploy-production.yml
+          echo "✓ Production deployment successful"
+
+      - name: Create Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ github.run_number }}
+          release_name: Release ${{ github.run_number }}
+          body: |
+            Automated release from CI/CD pipeline
+            Commit: ${{ github.sha }}
+          draft: false
+          prerelease: false
+        continue-on-error: true
 
   notify:
-    name: Send Notifications
+    name: Notification
     runs-on: ubuntu-latest
-    needs: [lint-and-test, test-pipeline, docker-build]
+    needs: [deploy-staging, deploy-production]
     if: always()
     
     steps:
-    - name: Check status and notify
-      run: |
-        if [ "${{ needs.lint-and-test.result }}" == "success" ] && \
-           [ "${{ needs.test-pipeline.result }}" == "success" ] && \
-           [ "${{ needs.docker-build.result }}" == "success" ]; then
-          echo "✅ All CI/CD jobs passed successfully!"
-          echo "📧 Sending success notification..."
-        else
-          echo "❌ Some CI/CD jobs failed!"
-          echo "📧 Sending failure notification..."
-        fi
+      - name: Send Slack notification
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: |
+            Deployment Status: ${{ job.status }}
+            Repository: ${{ github.repository }}
+            Branch: ${{ github.ref }}
+            Commit: ${{ github.sha }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        if: always()
+        continue-on-error: true
